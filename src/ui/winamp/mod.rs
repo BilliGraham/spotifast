@@ -37,14 +37,7 @@ pub use pixel_text::PixelText;
 /// The stack's height in skin pixels: the main window, and the equalizer
 /// and the playlist under it, whichever are open.
 fn stack_height(settings: &crate::settings::Settings) -> u32 {
-    let mut height = if settings.winamp_shaded {
-        layout::SHADE_HEIGHT
-    } else {
-        layout::WINDOW_HEIGHT
-    };
-    if settings.vinyl_open {
-        height += vinyl::HEIGHT;
-    }
+    let mut height = main_height(settings);
     if settings.eq_open {
         height += if settings.eq_shaded {
             layout::EQ_SHADE_HEIGHT
@@ -62,6 +55,18 @@ fn stack_height(settings: &crate::settings::Settings) -> u32 {
         };
     }
     height
+}
+
+/// The main window's height in skin pixels: rolled up, as the skin draws
+/// it, or taller to make room for the turntable.
+fn main_height(settings: &crate::settings::Settings) -> u32 {
+    if settings.winamp_shaded {
+        layout::SHADE_HEIGHT
+    } else if settings.vinyl_open {
+        layout::WINDOW_HEIGHT + vinyl::EXTRA_HEIGHT
+    } else {
+        layout::WINDOW_HEIGHT
+    }
 }
 
 /// The window's size in logical points, for the given points per skin
@@ -128,12 +133,24 @@ struct View<'a> {
     /// The window's shape, when the skin is not a rectangle: nothing is
     /// painted outside it.
     mask: Option<&'a Mask>,
+    /// A taller window: the skin row it is cut at, and how many rows are
+    /// added there. See [`View::paint`].
+    stretch: Option<(u32, u32)>,
 }
 
 impl View<'_> {
+    /// Where a skin row is drawn: rows from the cut down move by the rows
+    /// added.
+    fn row(&self, y: u32) -> u32 {
+        match self.stretch {
+            Some((split, extra)) if y >= split => y + extra,
+            _ => y,
+        }
+    }
+
     fn rect(&self, area: Area) -> Rect {
         Rect::from_min_size(
-            self.origin + vec2(area.x as f32, area.y as f32) * self.unit,
+            self.origin + vec2(area.x as f32, self.row(area.y) as f32) * self.unit,
             vec2(area.width as f32, area.height as f32) * self.unit,
         )
     }
@@ -143,6 +160,11 @@ impl View<'_> {
         (pos.x - self.origin.x) / self.unit
     }
 
+    /// Paints a sprite with its top left at skin pixel `x`, `y`. In a
+    /// stretched window, a sprite that starts below the cut moves down with
+    /// it, and one that the cut runs through (the background, the clutter
+    /// bar) is split there, with the row above the cut repeated to fill the
+    /// added rows, so the boxes it draws grow instead of breaking.
     fn paint(&self, painter: &egui::Painter, sprite: Sprite, x: u32, y: u32) {
         let Some((bitmap, clipped)) = self.skin.sprite(sprite) else {
             return;
@@ -151,9 +173,9 @@ impl View<'_> {
             return;
         };
         let (width, height) = (bitmap.width as f32, bitmap.height as f32);
-        // A piece of the sprite, `dx` in and `columns` wide, on one row or
-        // all of them.
-        let piece = |dx: u32, dy: u32, columns: u32, rows: u32| {
+        // `rows` rows of the sprite from `dy`, `columns` wide from `dx`,
+        // drawn `drawn_rows` tall from window row `top`.
+        let piece = |dx: u32, dy: u32, columns: u32, rows: u32, top: u32, drawn_rows: u32| {
             let uv = Rect::from_min_max(
                 pos2(
                     (clipped.x + dx) as f32 / width,
@@ -165,24 +187,35 @@ impl View<'_> {
                 ),
             );
             let dest = Rect::from_min_size(
-                self.origin + vec2((x + dx) as f32, (y + dy) as f32) * self.unit,
-                vec2(columns as f32, rows as f32) * self.unit,
+                self.origin + vec2((x + dx) as f32, top as f32) * self.unit,
+                vec2(columns as f32, drawn_rows as f32) * self.unit,
             );
             painter.image(texture, dest, uv, Color32::WHITE);
         };
-        match self.mask {
-            None => piece(0, 0, clipped.width, clipped.height),
+        // Rows `dy..dy + rows` of the sprite, from window row `top`, each
+        // `scale` rows tall, cut to the window's shape.
+        let band = |dy: u32, rows: u32, top: u32, scale: u32| match self.mask {
+            None => piece(0, dy, clipped.width, rows, top, rows * scale),
             Some(mask) => {
-                for dy in 0..clipped.height {
-                    for (start, end) in mask.spans(y + dy) {
+                for row in 0..rows {
+                    for (start, end) in mask.spans(y + dy + row) {
                         let from = (*start).max(x);
                         let to = (*end).min(x + clipped.width);
                         if to > from {
-                            piece(from - x, dy, to - from, 1);
+                            piece(from - x, dy + row, to - from, 1, top + row * scale, scale);
                         }
                     }
                 }
             }
+        };
+        match self.stretch {
+            Some((split, extra)) if y < split && split < y + clipped.height => {
+                let above = split - y;
+                band(0, above, y, 1);
+                band(above - 1, 1, split, extra);
+                band(above, clipped.height - above, split + extra, 1);
+            }
+            _ => band(0, clipped.height, self.row(y), 1),
         }
     }
 
@@ -199,9 +232,10 @@ impl View<'_> {
 
     /// A block of skin pixels in one colour.
     fn fill(&self, x: u32, y: u32, width: u32, height: u32, color: Color32) {
+        let shift = self.row(y) - y;
         let block = |x: u32, y: u32, width: u32, height: u32| {
             let rect = Rect::from_min_size(
-                self.origin + vec2(x as f32, y as f32) * self.unit,
+                self.origin + vec2(x as f32, (y + shift) as f32) * self.unit,
                 vec2(width as f32, height as f32) * self.unit,
             );
             self.ui.painter().rect_filled(rect, 0.0, color);
@@ -354,8 +388,10 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         skin: &skin,
         textures: &textures,
         mask,
+        stretch: (!shaded && app.settings.vinyl_open)
+            .then_some((vinyl::SPLIT, vinyl::EXTRA_HEIGHT)),
     };
-    let vis_moving = if shaded {
+    let moving = if shaded {
         shade_bar(app, &mut view, &ctx, focused, now.as_ref());
         false
     } else {
@@ -363,24 +399,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     };
 
     // The other windows hang under this one in Winamp's order.
-    let mut below_y = if shaded {
-        layout::SHADE_HEIGHT
-    } else {
-        layout::WINDOW_HEIGHT
-    };
-    let mut vinyl_spinning = false;
-    if app.settings.vinyl_open {
-        let mut below = View {
-            ui: view.ui,
-            origin: origin + vec2(0.0, below_y as f32 * unit),
-            unit,
-            skin: &skin,
-            textures: &textures,
-            mask: None,
-        };
-        vinyl_spinning = vinyl::show(app, &mut below, now.as_ref(), time);
-        below_y += vinyl::HEIGHT;
-    }
+    let mut below_y = main_height(&app.settings);
     if app.settings.eq_open {
         let eq_shaded = app.settings.eq_shaded;
         let mut below = View {
@@ -394,6 +413,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             } else {
                 skin.regions.equalizer.as_ref()
             },
+            stretch: None,
         };
         equalizer::show(app, &mut below, now.as_ref(), focused);
         below_y += if eq_shaded {
@@ -410,19 +430,20 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             skin: &skin,
             textures: &textures,
             mask: None,
+            stretch: None,
         };
         playlist::show(app, &mut below, now.as_ref(), focused);
     }
 
-    if vis_moving || vinyl_spinning {
+    if moving {
         crate::theme::visualiser_frame(&ctx, app.visualiser_fps());
     } else if now.is_some() {
         ctx.request_repaint_after(Duration::from_millis(220));
     }
 }
 
-/// The main window as it usually is. Returns whether the visualiser is
-/// still moving.
+/// The main window as it usually is. Returns whether the visualiser or the
+/// turntable is still moving.
 fn full_window(
     app: &mut App,
     view: &mut View,
@@ -438,8 +459,14 @@ fn full_window(
     title_bar(app, view, ctx, focused);
     clutter_bar(app, view, now);
     status(app, view, now);
-    time_display(app, view, now, time);
-    let vis_moving = visualiser(app, view, now);
+    let turntable = app.settings.vinyl_open;
+    if !turntable {
+        time_display(app, view, now, time);
+    }
+    let mut vis_moving = visualiser(app, view, now);
+    if turntable {
+        vis_moving |= vinyl::show(app, view, now, time);
+    }
     marquee(app, view, now);
     rates(app, view, now);
     sliders(app, view, now);
@@ -1060,16 +1087,19 @@ fn status(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
         Some(_) if !stopped(now) => sprites::STATUS_PAUSED,
         _ => sprites::STATUS_STOPPED,
     };
-    view.sprite(status, layout::STATUS);
-    let working = now.is_some_and(|now| now.loading);
-    view.sprite(
-        if working {
-            sprites::WORK_INDICATOR_ON
-        } else {
-            sprites::WORK_INDICATOR_OFF
-        },
-        layout::WORK_INDICATOR,
-    );
+    // The turntable takes the lamps' place in the display.
+    if !app.settings.vinyl_open {
+        view.sprite(status, layout::STATUS);
+        let working = now.is_some_and(|now| now.loading);
+        view.sprite(
+            if working {
+                sprites::WORK_INDICATOR_ON
+            } else {
+                sprites::WORK_INDICATOR_OFF
+            },
+            layout::WORK_INDICATOR,
+        );
+    }
     let sounding = now.is_some() && !stopped(now);
     let mono = app.settings.mono;
     let (stereo, mono_lamp) = match (sounding, mono) {
@@ -1694,7 +1724,7 @@ mod tests {
     #[test]
     fn the_first_size_is_a_whole_multiple_of_the_skin() {
         let mut settings = crate::settings::Settings::default();
-        assert_eq!(initial_size(&settings), vec2(550.0, 464.0));
+        assert_eq!(initial_size(&settings), vec2(550.0, 340.0));
         settings.vinyl_open = false;
         assert_eq!(initial_size(&settings), vec2(550.0, 232.0));
         settings.skin_scale = Some(1);
