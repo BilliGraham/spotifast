@@ -1,17 +1,14 @@
 //! The turntable in the main window's display, where the time was.
 //!
 //! A picture disc spins at 16⅔ rpm: the playing album's cover shows through
-//! the grooves, and a paper label in the middle names the song and the
-//! artist. The tone arm tracks across it as the song plays. Classic skins
-//! have no bitmaps for it, so it is drawn with shapes in fixed colours on
-//! the skin's display colour.
+//! the grooves all the way to the centre hole. The tone arm tracks across
+//! it as the song plays. Classic skins have no bitmaps for it, so it is
+//! drawn with shapes in fixed colours on the skin's display colour.
 
 use std::f32::consts::TAU;
 
-use egui::emath::Rot2;
-use egui::epaint::{Mesh, PathShape, TextShape, Vertex, WHITE_UV};
-use egui::text::{LayoutJob, TextFormat, TextWrapping};
-use egui::{Align, Color32, FontId, Id, Pos2, Sense, Stroke, Vec2, pos2, vec2};
+use egui::epaint::{Mesh, Vertex, WHITE_UV};
+use egui::{Color32, Id, Pos2, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::app::{App, NowPlaying};
 use crate::model::Action;
@@ -59,7 +56,12 @@ const TIMER_SCALE: u32 = 1;
 const CENTER: Pos2 = pos2(43.0, 54.0);
 const PLATTER_RADIUS: f32 = 42.0;
 const RECORD_RADIUS: f32 = 40.0;
-const LABEL_RADIUS: f32 = 17.0;
+/// The smooth middle, where the grooves end.
+const INNER_RADIUS: f32 = 17.0;
+/// The centre hole and the spindle in it. A real LP's hole is about 1.0 at
+/// this scale; it is drawn larger so it shows at the mini player's size.
+const HOLE_RADIUS: f32 = 2.8;
+const SPINDLE_RADIUS: f32 = 1.1;
 /// Where the stylus sits at the first and the last second of a song.
 const LEAD_IN_RADIUS: f32 = 38.0;
 const RUN_OUT_RADIUS: f32 = 21.0;
@@ -76,8 +78,7 @@ const ALUMINIUM_DARK: Color32 = Color32::from_rgb(120, 122, 128);
 const VINYL: Color32 = Color32::from_rgb(14, 14, 16);
 const GROOVE: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 110);
 const GROOVE_EDGE: Color32 = Color32::from_rgb(40, 40, 44);
-const PAPER: Color32 = Color32::from_rgb(236, 226, 202);
-const INK: Color32 = Color32::from_rgb(52, 34, 26);
+const HOLE: Color32 = Color32::from_rgb(24, 24, 28);
 
 /// Draws the deck over the display box. A click on it plays or pauses.
 /// Returns whether the record is spinning.
@@ -104,7 +105,7 @@ pub(super) fn show(app: &mut App, view: &mut View, now: Option<&NowPlaying>, tim
     deck.platter(angle);
     deck.picture(view, now, angle);
     deck.grooves();
-    deck.label(now, angle);
+    deck.hole();
     deck.tone_arm(view.ui.ctx(), now);
 
     let rect = egui::Rect::from_min_size(deck.origin, Vec2::splat(100.0 * deck.scale));
@@ -290,19 +291,32 @@ impl Deck {
             .circle_filled(center, RECORD_RADIUS * scale, VINYL);
     }
 
-    /// The cover across the whole disc, under the grooves, as on a picture
-    /// disc. The label covers its middle.
+    /// The cover across the whole disc, under the grooves and darkened by
+    /// the vinyl, as on a picture disc.
     fn picture(&self, view: &View, now: Option<&NowPlaying>, angle: f32) {
         let Some(texture) = cover(view, now, RECORD_RADIUS * self.scale) else {
             return;
         };
-        let center = self.at(CENTER);
         let tint = Color32::from_white_alpha(PICTURE_ALPHA);
+        self.cover_ring(texture, angle, 0.0, RECORD_RADIUS - 1.0, tint);
+    }
+
+    /// The part of the turning cover from `inner` to `outer` deck units from
+    /// the spindle.
+    fn cover_ring(
+        &self,
+        texture: egui::TextureId,
+        angle: f32,
+        inner: f32,
+        outer: f32,
+        tint: Color32,
+    ) {
+        let center = self.at(CENTER);
         let (rings, segments) = (6, 96);
         let mut mesh = Mesh::with_texture(texture);
         for ring in 0..=rings {
             let fraction = ring as f32 / rings as f32;
-            let radius = LABEL_RADIUS + (RECORD_RADIUS - 1.0 - LABEL_RADIUS) * fraction;
+            let radius = inner + (outer - inner) * fraction;
             for segment in 0..=segments {
                 let theta = segment as f32 / segments as f32 * TAU;
                 let along = Vec2::angled(theta - angle) * (radius / RECORD_RADIUS) * 0.5;
@@ -337,7 +351,7 @@ impl Deck {
         );
         let mut radius = RECORD_RADIUS - 2.0;
         let mut groove = 0;
-        while radius > LABEL_RADIUS + 1.5 {
+        while radius > INNER_RADIUS + 1.5 {
             let width = if groove % 7 == 6 { 0.9 } else { 0.3 };
             self.painter
                 .circle_stroke(center, radius * scale, Stroke::new(width * scale, GROOVE));
@@ -352,7 +366,7 @@ impl Deck {
     fn sheen(&self, start: f32, sweep: f32) {
         let center = self.at(CENTER);
         let steps = 16;
-        let inner = (LABEL_RADIUS + 3.0) * self.scale;
+        let inner = (INNER_RADIUS + 3.0) * self.scale;
         let outer = (RECORD_RADIUS - 1.0) * self.scale;
         let mut mesh = Mesh::default();
         for step in 0..=steps {
@@ -376,86 +390,24 @@ impl Deck {
         self.painter.add(mesh);
     }
 
-    /// The paper label: the song's title above the spindle, the artist
-    /// below it, and STEREO and 33⅓ RPM at the sides, all turning with the
-    /// record.
-    fn label(&self, now: Option<&NowPlaying>, angle: f32) {
+    /// The centre hole, with the platter's spindle showing through it.
+    fn hole(&self) {
         let center = self.at(CENTER);
         let scale = self.scale;
         self.painter
-            .circle_filled(center, LABEL_RADIUS * scale, PAPER);
+            .circle_filled(center, HOLE_RADIUS * scale, HOLE);
         self.painter.circle_stroke(
             center,
-            (LABEL_RADIUS - 1.1) * scale,
-            Stroke::new(0.25 * scale, INK.gamma_multiply(0.5)),
+            HOLE_RADIUS * scale,
+            Stroke::new(0.3 * scale, GROOVE_EDGE),
         );
-        let rotation = Rot2::from_angle(angle);
-        if let Some(now) = now {
-            self.print(&now.title, 3.0, 27.0, 2, vec2(0.0, -8.5), rotation);
-            let artist = now
-                .artists
-                .first()
-                .map_or(now.subtitle.as_str(), |artist| artist.name.as_str())
-                .to_uppercase();
-            self.print(&artist, 3.4, 27.0, 1, vec2(0.0, 7.5), rotation);
-        }
-        let stereo = self.print("STEREO", 1.9, 11.0, 1, vec2(-10.0, 1.8), rotation);
-        self.frame(vec2(-10.0, 1.8), stereo + vec2(1.2, 0.7), rotation);
-        // Not "33⅓": the fallback fonts have no glyph for the fraction.
-        self.print("33 1/3 RPM", 1.9, 12.0, 1, vec2(10.0, 1.8), rotation);
-
         self.painter
-            .circle_filled(center, 2.3 * scale, PAPER.gamma_multiply(0.75));
-        self.painter.circle_filled(center, 1.4 * scale, ALUMINIUM);
-        self.painter
-            .circle_filled(center, 0.7 * scale, ALUMINIUM_DARK);
-    }
-
-    /// Centred print on the label, at most `width` deck units wide and
-    /// `rows` lines tall, cut short with an ellipsis. `offset` is from the
-    /// spindle before the record's turn. Returns its size in deck units.
-    fn print(
-        &self,
-        text: &str,
-        size: f32,
-        width: f32,
-        rows: usize,
-        offset: Vec2,
-        rotation: Rot2,
-    ) -> Vec2 {
-        let font = FontId::proportional(size * self.scale);
-        let mut job = LayoutJob::single_section(text.to_owned(), TextFormat::simple(font, INK));
-        job.wrap = TextWrapping {
-            max_width: width * self.scale,
-            max_rows: rows,
-            break_anywhere: false,
-            overflow_character: Some('…'),
-        };
-        job.halign = Align::Center;
-        let galley = self.painter.layout_job(job);
-        let measured = galley.rect.size() / self.scale;
-        let middle = galley.rect.center().to_vec2();
-        let pos = self.at(CENTER) + rotation * (offset * self.scale - middle);
-        self.painter
-            .add(TextShape::new(pos, galley, INK).with_angle(rotation.angle()));
-        measured
-    }
-
-    /// A thin box of `size` deck units around `offset`, turned with the
-    /// label.
-    fn frame(&self, offset: Vec2, size: Vec2, rotation: Rot2) {
-        let half = size / 2.0;
-        let corners = [
-            vec2(-half.x, -half.y),
-            vec2(half.x, -half.y),
-            vec2(half.x, half.y),
-            vec2(-half.x, half.y),
-        ]
-        .map(|corner| self.at(CENTER) + rotation * ((offset + corner) * self.scale));
-        self.painter.add(PathShape::closed_line(
-            corners.to_vec(),
-            Stroke::new(0.25 * self.scale, INK),
-        ));
+            .circle_filled(center, SPINDLE_RADIUS * scale, ALUMINIUM_DARK);
+        self.painter.circle_filled(
+            center - vec2(0.25, 0.25) * scale,
+            SPINDLE_RADIUS * 0.55 * scale,
+            ALUMINIUM,
+        );
     }
 
     fn tone_arm(&self, ctx: &egui::Context, now: Option<&NowPlaying>) {
