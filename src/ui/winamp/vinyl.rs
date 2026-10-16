@@ -1,6 +1,6 @@
 //! The turntable in the main window's display, where the time was.
 //!
-//! A picture disc spins at 33⅓ rpm: the playing album's cover shows through
+//! A picture disc spins at 16⅔ rpm: the playing album's cover shows through
 //! the grooves, and a paper label in the middle names the song and the
 //! artist. The tone arm tracks across it as the song plays. Classic skins
 //! have no bitmaps for it, so it is drawn with shapes in fixed colours on
@@ -35,7 +35,8 @@ const DISPLAY: Area = Area::new(10, 22, 93, 44 + EXTRA_HEIGHT);
 /// The deck, square and centred in the display.
 pub const DECK: Area = Area::new(20, 23, 72, 72);
 
-const RPM: f32 = 100.0 / 3.0;
+// Half a real LP's 33⅓ rpm on purpose: the real speed looked too fast here.
+const RPM: f32 = 50.0 / 3.0;
 
 /// The song box on the right of the display, in the skin's own main
 /// bitmap: its left column, its width, and its top and bottom edge rows.
