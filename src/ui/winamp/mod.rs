@@ -219,6 +219,35 @@ impl View<'_> {
         }
     }
 
+    /// Paints a sprite at window skin pixel `x`, `y`, drawn `width` by
+    /// `height` skin pixels, where the stretch has already been allowed
+    /// for. Nearest-neighbour textures keep a whole-number enlargement
+    /// sharp. The window's shape is not applied.
+    fn paint_placed(&self, sprite: Sprite, x: u32, y: u32, width: u32, height: u32) {
+        let Some((bitmap, clipped)) = self.skin.sprite(sprite) else {
+            return;
+        };
+        let Some(&texture) = self.textures.get(&sprite.sheet) else {
+            return;
+        };
+        let (sheet_width, sheet_height) = (bitmap.width as f32, bitmap.height as f32);
+        let uv = Rect::from_min_max(
+            pos2(
+                clipped.x as f32 / sheet_width,
+                clipped.y as f32 / sheet_height,
+            ),
+            pos2(
+                (clipped.x + clipped.width) as f32 / sheet_width,
+                (clipped.y + clipped.height) as f32 / sheet_height,
+            ),
+        );
+        let dest = Rect::from_min_size(
+            self.origin + vec2(x as f32, y as f32) * self.unit,
+            vec2(width as f32, height as f32) * self.unit,
+        );
+        self.ui.painter().image(texture, dest, uv, Color32::WHITE);
+    }
+
     fn sprite_at(&self, sprite: Sprite, x: u32, y: u32) {
         self.paint(self.ui.painter(), sprite, x, y);
     }
@@ -457,16 +486,21 @@ fn full_window(
         Area::new(0, 0, layout::WINDOW_WIDTH, layout::WINDOW_HEIGHT),
     );
     title_bar(app, view, ctx, focused);
-    clutter_bar(app, view, now);
-    status(app, view, now);
+    // The turntable fills the whole display box, so the clutter bar, the
+    // time and the visualiser are not drawn there. The options menu is
+    // still on a right-click on the title bar.
     let turntable = app.settings.vinyl_open;
     if !turntable {
+        clutter_bar(app, view, now);
+    }
+    status(app, view, now);
+    let vis_moving = if turntable {
+        vinyl::timer_box(app, view, now, time);
+        vinyl::show(app, view, now, time)
+    } else {
         time_display(app, view, now, time);
-    }
-    let mut vis_moving = visualiser(app, view, now);
-    if turntable {
-        vis_moving |= vinyl::show(app, view, now, time);
-    }
+        visualiser(app, view, now)
+    };
     marquee(app, view, now);
     rates(app, view, now);
     sliders(app, view, now);
@@ -1127,6 +1161,42 @@ fn status(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
     }
 }
 
+/// What the time display shows: nothing, or four digits and whether they
+/// count down.
+enum ShownTime {
+    Blank,
+    Time { digits: [u32; 4], remaining: bool },
+}
+
+/// The time to show: elapsed, or remaining, blinking while paused, blank
+/// with nothing on.
+fn shown_time(app: &App, now: Option<&NowPlaying>, time: f64) -> ShownTime {
+    let Some(now) = now.filter(|now| !stopped(Some(now))) else {
+        return ShownTime::Blank;
+    };
+    let paused = !now.playing && !now.loading;
+    if paused && (time * 2.0).floor() as i64 % 2 == 1 {
+        return ShownTime::Blank;
+    }
+    let position = match app.seek_preview {
+        Some(fraction) => (fraction * now.duration_ms as f32) as u32,
+        None => now.position_ms,
+    };
+    let remaining = app.winamp.time_remaining && now.duration_ms > 0;
+    let shown = if remaining {
+        now.duration_ms.saturating_sub(position)
+    } else {
+        position
+    };
+    let seconds = shown / 1000;
+    let minutes = (seconds / 60).min(99);
+    let seconds = seconds % 60;
+    ShownTime::Time {
+        digits: [minutes / 10, minutes % 10, seconds / 10, seconds % 10],
+        remaining,
+    }
+}
+
 /// The time in the skin's digits: elapsed, or remaining with a minus sign,
 /// blinking while paused, blank with nothing on.
 fn time_display(app: &mut App, view: &mut View, now: Option<&NowPlaying>, time: f64) {
@@ -1156,29 +1226,10 @@ fn time_display(app: &mut App, view: &mut View, now: Option<&NowPlaying>, time: 
             view.sprite(sprites::NUMBERS_NO_MINUS, layout::MINUS);
         }
     };
-    let Some(now) = now.filter(|now| !stopped(Some(now))) else {
+    let ShownTime::Time { digits, remaining } = shown_time(app, now, time) else {
         blank(view);
         return;
     };
-    let paused = !now.playing && !now.loading;
-    if paused && (time * 2.0).floor() as i64 % 2 == 1 {
-        blank(view);
-        return;
-    }
-    let position = match app.seek_preview {
-        Some(fraction) => (fraction * now.duration_ms as f32) as u32,
-        None => now.position_ms,
-    };
-    let remaining = app.winamp.time_remaining && now.duration_ms > 0;
-    let shown = if remaining {
-        now.duration_ms.saturating_sub(position)
-    } else {
-        position
-    };
-    let seconds = shown / 1000;
-    let minutes = (seconds / 60).min(99);
-    let seconds = seconds % 60;
-    let digits = [minutes / 10, minutes % 10, seconds / 10, seconds % 10];
     for (value, cell) in digits.into_iter().zip(layout::TIME_DIGITS) {
         let sprite = if extended {
             sprites::digit_ex(value)
@@ -1724,7 +1775,7 @@ mod tests {
     #[test]
     fn the_first_size_is_a_whole_multiple_of_the_skin() {
         let mut settings = crate::settings::Settings::default();
-        assert_eq!(initial_size(&settings), vec2(550.0, 340.0));
+        assert_eq!(initial_size(&settings), vec2(550.0, 292.0));
         settings.vinyl_open = false;
         assert_eq!(initial_size(&settings), vec2(550.0, 232.0));
         settings.skin_scale = Some(1);

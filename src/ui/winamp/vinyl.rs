@@ -15,23 +15,44 @@ use egui::{Align, Color32, FontId, Id, Pos2, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::app::{App, NowPlaying};
 use crate::model::Action;
-use crate::skin::layout::Area;
+use crate::skin::layout::{self, Area};
+use crate::skin::{Sheet, Sprite, sprites};
 
-use super::View;
+use super::{ShownTime, View, shown_time, stopped};
 
 /// How much taller the main window is with the turntable: the display box
 /// grows by this many skin pixels to make room for a square deck.
-pub const EXTRA_HEIGHT: u32 = 54;
+pub const EXTRA_HEIGHT: u32 = 30;
 /// The skin row where the main window is cut and stretched. Everything
 /// that starts at or below it moves down by [`EXTRA_HEIGHT`]. It is above
-/// the clutter bar's O and the display's contents, and below the boxes'
-/// top edges, so the stretched row is the inside of the boxes.
+/// the display's contents and below the boxes' top edges, so the
+/// stretched row is the inside of the boxes.
 pub const SPLIT: u32 = 25;
-/// The deck, in window skin pixels after the stretch: inside the display
-/// box, above the visualiser.
-pub const DECK: Area = Area::new(27, 25, 70, 70);
+/// The inside of the display box on the left, in window skin pixels after
+/// the stretch. The turntable covers it all: the clutter bar and the
+/// visualiser that were in it are left out.
+const DISPLAY: Area = Area::new(10, 22, 93, 44 + EXTRA_HEIGHT);
+/// The deck, square and centred in the display.
+pub const DECK: Area = Area::new(20, 23, 72, 72);
 
 const RPM: f32 = 100.0 / 3.0;
+
+/// The song box on the right of the display, in the skin's own main
+/// bitmap: its left column, its width, and its top and bottom edge rows.
+const INFO_X: u32 = 106;
+const INFO_WIDTH: u32 = 165;
+const INFO_TOP: u32 = 21;
+const INFO_BOTTOM: u32 = 55;
+/// Rows taken whole from the box's top and bottom when a box of another
+/// height is built from it, enough for a bevelled edge.
+const INFO_EDGE: u32 = 3;
+/// A row of plain panel between the title bar and the boxes.
+const PANEL_ROW: u32 = 17;
+/// The timer box above the song box, in window rows after the stretch.
+const TIMER_TOP: u32 = INFO_TOP;
+const TIMER_BOTTOM: u32 = INFO_TOP + EXTRA_HEIGHT - 3;
+/// The time digits and the lamp are drawn this many times their size.
+const TIMER_SCALE: u32 = 1;
 
 // The deck's own coordinates: a square 100 wide.
 const CENTER: Pos2 = pos2(43.0, 54.0);
@@ -57,9 +78,8 @@ const GROOVE_EDGE: Color32 = Color32::from_rgb(40, 40, 44);
 const PAPER: Color32 = Color32::from_rgb(236, 226, 202);
 const INK: Color32 = Color32::from_rgb(52, 34, 26);
 
-/// Draws the deck over the display box. A click on it goes to the next
-/// visualiser, as a click on the visualiser does. Returns whether the
-/// record is spinning.
+/// Draws the deck over the display box. A click on it plays or pauses.
+/// Returns whether the record is spinning.
 pub(super) fn show(app: &mut App, view: &mut View, now: Option<&NowPlaying>, time: f64) -> bool {
     let playing = now.is_some_and(|now| now.playing);
     let spinning = playing && !crate::motion::reduced(view.ui.ctx());
@@ -73,7 +93,10 @@ pub(super) fn show(app: &mut App, view: &mut View, now: Option<&NowPlaying>, tim
         scale: view.unit * DECK.width as f32 / 100.0,
     };
     deck.painter.rect_filled(
-        egui::Rect::from_min_size(deck.origin, Vec2::splat(100.0 * deck.scale)),
+        egui::Rect::from_min_size(
+            view.origin + vec2(DISPLAY.x as f32, DISPLAY.y as f32) * view.unit,
+            vec2(DISPLAY.width as f32, DISPLAY.height as f32) * view.unit,
+        ),
         0.0,
         Color32::from_rgb(r, g, b),
     );
@@ -88,10 +111,133 @@ pub(super) fn show(app: &mut App, view: &mut View, now: Option<&NowPlaying>, tim
         .ui
         .interact(rect, Id::new(("winamp", "vinyl-deck")), Sense::click())
         .clicked()
+        && now.is_some()
     {
-        app.actions.push(Action::CycleVisualiser);
+        app.actions.push(Action::TogglePlay);
     }
     spinning
+}
+
+/// The right side of the taller display: the song box moved down whole to
+/// sit on its contents, and above it a timer box with the play lamp and the
+/// time. Both boxes are cut from the skin's own song
+/// box, so they match any skin. A click on the timer switches between
+/// elapsed and remaining time, as on the classic display.
+pub(super) fn timer_box(app: &mut App, view: &mut View, now: Option<&NowPlaying>, time: f64) {
+    let main =
+        |x: u32, y: u32, width: u32, height: u32| Sprite::new(Sheet::Main, x, y, width, height);
+    let song_top = INFO_TOP + EXTRA_HEIGHT;
+    view.paint_placed(
+        main(INFO_X, PANEL_ROW, INFO_WIDTH, 1),
+        INFO_X,
+        INFO_TOP,
+        INFO_WIDTH,
+        song_top - INFO_TOP,
+    );
+    view.paint_placed(
+        main(INFO_X, INFO_TOP, INFO_WIDTH, SPLIT - INFO_TOP),
+        INFO_X,
+        song_top,
+        INFO_WIDTH,
+        SPLIT - INFO_TOP,
+    );
+
+    let edge = |y: u32| main(INFO_X, y, INFO_WIDTH, INFO_EDGE);
+    view.paint_placed(edge(INFO_TOP), INFO_X, TIMER_TOP, INFO_WIDTH, INFO_EDGE);
+    view.paint_placed(
+        main(INFO_X, INFO_TOP + INFO_EDGE, INFO_WIDTH, 1),
+        INFO_X,
+        TIMER_TOP + INFO_EDGE,
+        INFO_WIDTH,
+        TIMER_BOTTOM + 1 - TIMER_TOP - 2 * INFO_EDGE,
+    );
+    view.paint_placed(
+        edge(INFO_BOTTOM + 1 - INFO_EDGE),
+        INFO_X,
+        TIMER_BOTTOM + 1 - INFO_EDGE,
+        INFO_WIDTH,
+        INFO_EDGE,
+    );
+
+    let clock_x = layout::MINUS_EX.x;
+    let clock_width = layout::SECOND_ONES.x + layout::SECOND_ONES.width - clock_x;
+    let clock_height = layout::MINUS_EX.height;
+    let lamp = layout::STATUS;
+    let gap = 3;
+    let content_width = (lamp.width + gap + clock_width) * TIMER_SCALE;
+    let left = INFO_X + (INFO_WIDTH - content_width) / 2;
+    let clock_left = left + (lamp.width + gap) * TIMER_SCALE;
+    let timer_height = TIMER_BOTTOM + 1 - TIMER_TOP;
+    let clock_top = TIMER_TOP + (timer_height - clock_height * TIMER_SCALE) / 2;
+    // The lamp sits as far below the digits' top as it does in the classic
+    // display.
+    let lamp_top = clock_top + (lamp.y - layout::MINUS_EX.y) * TIMER_SCALE;
+    let scaled = |view: &View, sprite: Sprite, x: u32, y: u32| {
+        view.paint_placed(
+            sprite,
+            x,
+            y,
+            sprite.width * TIMER_SCALE,
+            sprite.height * TIMER_SCALE,
+        );
+    };
+
+    let status = match now {
+        Some(now) if now.playing || now.loading => sprites::STATUS_PLAYING,
+        Some(_) if !stopped(now) => sprites::STATUS_PAUSED,
+        _ => sprites::STATUS_STOPPED,
+    };
+    scaled(view, status, left, lamp_top);
+    // The colon is part of the skin's background, not of the digit sheet,
+    // so the clock is drawn on a copy of the background under the classic
+    // time.
+    scaled(
+        view,
+        main(clock_x, layout::MINUS_EX.y, clock_width, clock_height),
+        clock_left,
+        clock_top,
+    );
+    let at = |area: Area| {
+        (
+            clock_left + (area.x - clock_x) * TIMER_SCALE,
+            clock_top + (area.y - layout::MINUS_EX.y) * TIMER_SCALE,
+        )
+    };
+    let extended = view.skin.has_extended_digits();
+    let (digits, remaining) = match shown_time(app, now, time) {
+        ShownTime::Time { digits, remaining } => (Some(digits), remaining),
+        ShownTime::Blank => (None, false),
+    };
+    for (index, cell) in layout::TIME_DIGITS.into_iter().enumerate() {
+        let sprite = match (digits, extended) {
+            (Some(digits), true) => sprites::digit_ex(digits[index]),
+            (Some(digits), false) => sprites::digit(digits[index]),
+            (None, true) => sprites::NUMS_EX_BLANK,
+            (None, false) => sprites::NUMBERS_BLANK,
+        };
+        let (x, y) = at(cell);
+        scaled(view, sprite, x, y);
+    }
+    let (sign, sign_area) = match (extended, remaining) {
+        (true, true) => (sprites::NUMS_EX_MINUS, layout::MINUS_EX),
+        (true, false) => (sprites::NUMS_EX_BLANK, layout::MINUS_EX),
+        (false, true) => (sprites::NUMBERS_MINUS, layout::MINUS),
+        (false, false) => (sprites::NUMBERS_NO_MINUS, layout::MINUS),
+    };
+    let (x, y) = at(sign_area);
+    scaled(view, sign, x, y);
+
+    let rect = egui::Rect::from_min_max(
+        view.origin + vec2(INFO_X as f32, TIMER_TOP as f32) * view.unit,
+        view.origin + vec2((INFO_X + INFO_WIDTH) as f32, (TIMER_BOTTOM + 1) as f32) * view.unit,
+    );
+    if view
+        .ui
+        .interact(rect, Id::new(("winamp", "vinyl-timer")), Sense::click())
+        .clicked()
+    {
+        app.winamp.time_remaining = !app.winamp.time_remaining;
+    }
 }
 
 /// The record's turn in radians. It only advances while the record spins,
@@ -432,19 +578,25 @@ mod tests {
     }
 
     #[test]
-    fn the_deck_fits_above_the_moved_visualiser() {
+    fn the_deck_fits_inside_the_display() {
         assert_eq!(DECK.width, DECK.height);
-        assert!(DECK.y >= SPLIT);
-        let visualiser = layout::VISUALIZER.y + EXTRA_HEIGHT;
-        assert!(DECK.y + DECK.height <= visualiser);
-        assert!(DECK.x >= layout::CLUTTER_BAR.x + layout::CLUTTER_BAR.width);
-        assert!(DECK.x + DECK.width <= layout::VISUALIZER.x + layout::VISUALIZER.width);
+        assert!(DECK.x >= DISPLAY.x && DECK.y >= DISPLAY.y);
+        assert!(DECK.x + DECK.width <= DISPLAY.x + DISPLAY.width);
+        assert!(DECK.y + DECK.height <= DISPLAY.y + DISPLAY.height);
         for (name, area) in layout::ALL {
-            let starts_inside_display = area.y < SPLIT && area.y + area.height > SPLIT;
+            let crosses = area.y < SPLIT && area.y + area.height > SPLIT;
+            // The clutter bar is not drawn with the turntable.
             assert!(
-                !starts_inside_display || *name == "CLUTTER_BAR" || *name == "TITLE_BAR",
+                !crosses || *name == "CLUTTER_BAR",
                 "{name} crosses the stretched row"
             );
         }
+    }
+
+    #[test]
+    fn the_timer_box_fits_its_digits_above_the_song_box() {
+        let clock = layout::MINUS_EX.height * TIMER_SCALE;
+        assert!(TIMER_BOTTOM + 1 - TIMER_TOP >= clock + 2 * INFO_EDGE);
+        assert!(TIMER_BOTTOM < INFO_TOP + EXTRA_HEIGHT);
     }
 }
