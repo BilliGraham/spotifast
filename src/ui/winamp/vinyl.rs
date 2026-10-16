@@ -1,14 +1,17 @@
 //! The turntable window, between the main window and the equalizer.
 //!
-//! A record spins at 33⅓ rpm with the playing album's cover as its label,
-//! and the tone arm tracks across it as the song plays. Classic skins have
-//! no bitmaps for this window, so it is drawn with shapes in fixed colours
-//! and only the text comes from the skin's font.
+//! A picture disc spins at 33⅓ rpm: the playing album's cover shows through
+//! the grooves, and a paper label in the middle names the song and the
+//! artist. The tone arm tracks across it as the song plays. Classic skins
+//! have no bitmaps for this window, so it is drawn with shapes in fixed
+//! colours and only the window's text comes from the skin's font.
 
 use std::f32::consts::TAU;
 
-use egui::epaint::{Mesh, Vertex, WHITE_UV};
-use egui::{Color32, Id, Pos2, Sense, Stroke, Vec2, pos2, vec2};
+use egui::emath::Rot2;
+use egui::epaint::{Mesh, PathShape, TextShape, Vertex, WHITE_UV};
+use egui::text::{LayoutJob, TextFormat, TextWrapping};
+use egui::{Align, Color32, FontId, Id, Pos2, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::app::{App, NowPlaying};
 use crate::i18n::gettext;
@@ -26,10 +29,12 @@ const TITLE_BAR: Area = Area::new(0, 0, layout::WINDOW_WIDTH, 12);
 const CENTER: Pos2 = pos2(66.0, 64.0);
 const PLATTER_RADIUS: f32 = 47.0;
 const RECORD_RADIUS: f32 = 44.0;
-const LABEL_RADIUS: f32 = 18.0;
+const LABEL_RADIUS: f32 = 19.0;
 /// Where the stylus sits at the first and the last second of a song.
 const LEAD_IN_RADIUS: f32 = 42.0;
-const RUN_OUT_RADIUS: f32 = 22.0;
+const RUN_OUT_RADIUS: f32 = 23.0;
+/// How strongly the cover shows through the black vinyl.
+const PICTURE_ALPHA: u8 = 115;
 
 const PIVOT: Pos2 = pos2(128.0, 24.0);
 const ARM_LENGTH: f32 = 66.0;
@@ -46,7 +51,10 @@ const STRIP: Color32 = Color32::from_rgb(24, 20, 18);
 const ALUMINIUM: Color32 = Color32::from_rgb(196, 198, 202);
 const ALUMINIUM_DARK: Color32 = Color32::from_rgb(120, 122, 128);
 const VINYL: Color32 = Color32::from_rgb(14, 14, 16);
-const GROOVE: Color32 = Color32::from_rgb(34, 34, 38);
+const GROOVE: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 110);
+const GROOVE_EDGE: Color32 = Color32::from_rgb(40, 40, 44);
+const PAPER: Color32 = Color32::from_rgb(236, 226, 202);
+const INK: Color32 = Color32::from_rgb(52, 34, 26);
 const LED_ON: Color32 = Color32::from_rgb(255, 64, 40);
 const LED_OFF: Color32 = Color32::from_rgb(80, 24, 18);
 
@@ -58,6 +66,8 @@ pub(super) fn show(app: &mut App, view: &mut View, now: Option<&NowPlaying>, tim
     plinth(view);
     title_bar(app, view);
     platter(view, angle);
+    picture(view, now, angle);
+    grooves(view);
     label(view, now, angle);
     if view
         .interact(
@@ -153,13 +163,63 @@ fn platter(view: &View, angle: f32) {
         painter.circle_filled(point, 0.5 * unit, ALUMINIUM_DARK);
     }
     painter.circle_filled(center, RECORD_RADIUS * unit, VINYL);
-    let mut radius = RECORD_RADIUS - 2.0;
-    while radius > LABEL_RADIUS + 2.0 {
-        painter.circle_stroke(center, radius * unit, Stroke::new(0.35 * unit, GROOVE));
-        radius -= 1.6;
+}
+
+/// The cover across the whole disc, under the grooves, as on a picture
+/// disc. The label covers its middle.
+fn picture(view: &View, now: Option<&NowPlaying>, angle: f32) {
+    let unit = view.unit;
+    let Some(texture) = cover(view, now, RECORD_RADIUS * unit) else {
+        return;
+    };
+    let center = at(view, CENTER);
+    let tint = Color32::from_white_alpha(PICTURE_ALPHA);
+    let (rings, segments) = (6, 96);
+    let mut mesh = Mesh::with_texture(texture);
+    for ring in 0..=rings {
+        let fraction = ring as f32 / rings as f32;
+        let radius = LABEL_RADIUS + (RECORD_RADIUS - 1.0 - LABEL_RADIUS) * fraction;
+        for segment in 0..=segments {
+            let theta = segment as f32 / segments as f32 * TAU;
+            let along = Vec2::angled(theta - angle) * (radius / RECORD_RADIUS) * 0.5;
+            mesh.vertices.push(Vertex {
+                pos: center + Vec2::angled(theta) * radius * unit,
+                uv: pos2(0.5, 0.5) + along,
+                color: tint,
+            });
+        }
     }
-    // A record's sheen comes from the room's light, so it stays still while
-    // the record turns under it.
+    let row = segments + 1;
+    for ring in 0..rings {
+        for segment in 0..segments {
+            let inner = ring * row + segment;
+            let outer = inner + row;
+            mesh.add_triangle(inner, outer, inner + 1);
+            mesh.add_triangle(inner + 1, outer, outer + 1);
+        }
+    }
+    view.ui.painter().add(mesh);
+}
+
+/// The grooves over the picture, with the bands between tracks and the
+/// sheen from the room's light, which stays still while the record turns.
+fn grooves(view: &View) {
+    let painter = view.ui.painter();
+    let unit = view.unit;
+    let center = at(view, CENTER);
+    painter.circle_stroke(
+        center,
+        (RECORD_RADIUS - 0.5) * unit,
+        Stroke::new(1.0 * unit, GROOVE_EDGE),
+    );
+    let mut radius = RECORD_RADIUS - 2.0;
+    let mut groove = 0;
+    while radius > LABEL_RADIUS + 1.5 {
+        let width = if groove % 7 == 6 { 0.9 } else { 0.3 };
+        painter.circle_stroke(center, radius * unit, Stroke::new(width * unit, GROOVE));
+        radius -= 1.3;
+        groove += 1;
+    }
     for (start, sweep) in [(-2.4_f32, 0.7_f32), (0.75, 0.7)] {
         sheen(painter, center, unit, start, sweep);
     }
@@ -194,48 +254,102 @@ fn sheen(painter: &egui::Painter, center: Pos2, unit: f32, start: f32, sweep: f3
     painter.add(mesh);
 }
 
-/// The album cover, cut to a circle and turned with the record.
+/// The paper label: the song's title above the spindle, the artist below
+/// it, and STEREO and 33⅓ RPM at the sides, all turning with the record.
 fn label(view: &View, now: Option<&NowPlaying>, angle: f32) {
     let painter = view.ui.painter();
     let unit = view.unit;
     let center = at(view, CENTER);
     let radius = LABEL_RADIUS * unit;
-    match cover(view, now, radius) {
-        Some(texture) => {
-            let segments = 64;
-            let mut mesh = Mesh::with_texture(texture);
-            mesh.vertices.push(Vertex {
-                pos: center,
-                uv: pos2(0.5, 0.5),
-                color: Color32::WHITE,
-            });
-            for segment in 0..=segments {
-                let theta = segment as f32 / segments as f32 * TAU;
-                let uv = pos2(0.5, 0.5) + Vec2::angled(theta - angle) * 0.5;
-                mesh.vertices.push(Vertex {
-                    pos: center + Vec2::angled(theta) * radius,
-                    uv,
-                    color: Color32::WHITE,
-                });
-            }
-            for segment in 0..segments {
-                mesh.add_triangle(0, segment + 1, segment + 2);
-            }
-            painter.add(mesh);
-        }
-        None => {
-            painter.circle_filled(center, radius, Color32::from_rgb(178, 34, 34));
-            let mark = center + Vec2::angled(angle) * radius * 0.6;
-            painter.circle_filled(mark, 1.5 * unit, Color32::from_rgb(240, 220, 180));
-        }
-    }
+    painter.circle_filled(center, radius, PAPER);
     painter.circle_stroke(
         center,
-        radius,
-        Stroke::new(0.5 * unit, Color32::from_black_alpha(160)),
+        radius - 1.2 * unit,
+        Stroke::new(0.25 * unit, INK.gamma_multiply(0.5)),
     );
+    let printed = LabelText {
+        painter,
+        center,
+        unit,
+        rotation: Rot2::from_angle(angle),
+    };
+    if let Some(now) = now {
+        printed.text(
+            &now.title,
+            FontId::proportional(3.4 * unit),
+            30.0,
+            2,
+            vec2(0.0, -9.5),
+        );
+        let artist = now
+            .artists
+            .first()
+            .map_or(now.subtitle.as_str(), |artist| artist.name.as_str())
+            .to_uppercase();
+        printed.text(
+            &artist,
+            FontId::proportional(3.8 * unit),
+            30.0,
+            1,
+            vec2(0.0, 8.5),
+        );
+    }
+    let small = FontId::proportional(2.1 * unit);
+    let stereo = printed.text("STEREO", small.clone(), 12.0, 1, vec2(-11.0, 2.0));
+    printed.frame(vec2(-11.0, 2.0), stereo + vec2(1.4, 0.8));
+    // Not "33⅓": the fallback fonts have no glyph for the fraction.
+    printed.text("33 1/3 RPM", small, 14.0, 1, vec2(11.0, 2.0));
+
+    painter.circle_filled(center, 2.6 * unit, PAPER.gamma_multiply(0.75));
     painter.circle_filled(center, 1.6 * unit, ALUMINIUM);
     painter.circle_filled(center, 0.8 * unit, ALUMINIUM_DARK);
+}
+
+/// Print on the label, which turns: positions are in skin pixels from the
+/// spindle, before the turn.
+struct LabelText<'a> {
+    painter: &'a egui::Painter,
+    center: Pos2,
+    unit: f32,
+    rotation: Rot2,
+}
+
+impl LabelText<'_> {
+    /// Centred text at most `width` skin pixels wide and `rows` lines tall,
+    /// cut short with an ellipsis. Returns its size in skin pixels.
+    fn text(&self, text: &str, font: FontId, width: f32, rows: usize, offset: Vec2) -> Vec2 {
+        let mut job = LayoutJob::single_section(text.to_owned(), TextFormat::simple(font, INK));
+        job.wrap = TextWrapping {
+            max_width: width * self.unit,
+            max_rows: rows,
+            break_anywhere: false,
+            overflow_character: Some('…'),
+        };
+        job.halign = Align::Center;
+        let galley = self.painter.layout_job(job);
+        let size = galley.rect.size() / self.unit;
+        let middle = galley.rect.center().to_vec2();
+        let pos = self.center + self.rotation * (offset * self.unit - middle);
+        self.painter
+            .add(TextShape::new(pos, galley, INK).with_angle(self.rotation.angle()));
+        size
+    }
+
+    /// A thin box of `size` skin pixels around `offset`.
+    fn frame(&self, offset: Vec2, size: Vec2) {
+        let half = size / 2.0;
+        let corners = [
+            vec2(-half.x, -half.y),
+            vec2(half.x, -half.y),
+            vec2(half.x, half.y),
+            vec2(-half.x, half.y),
+        ]
+        .map(|corner| self.center + self.rotation * ((offset + corner) * self.unit));
+        self.painter.add(PathShape::closed_line(
+            corners.to_vec(),
+            Stroke::new(0.25 * self.unit, INK),
+        ));
+    }
 }
 
 /// The playing cover's texture, once it is loaded.
