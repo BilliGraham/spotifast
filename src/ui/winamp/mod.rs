@@ -30,6 +30,7 @@ use super::widgets::{SliderEvent, wheel_notches};
 mod equalizer;
 mod pixel_text;
 mod playlist;
+mod vinyl;
 
 pub use pixel_text::PixelText;
 
@@ -41,6 +42,9 @@ fn stack_height(settings: &crate::settings::Settings) -> u32 {
     } else {
         layout::WINDOW_HEIGHT
     };
+    if settings.vinyl_open {
+        height += vinyl::HEIGHT;
+    }
     if settings.eq_open {
         height += if settings.eq_shaded {
             layout::EQ_SHADE_HEIGHT
@@ -364,6 +368,19 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     } else {
         layout::WINDOW_HEIGHT
     };
+    let mut vinyl_spinning = false;
+    if app.settings.vinyl_open {
+        let mut below = View {
+            ui: view.ui,
+            origin: origin + vec2(0.0, below_y as f32 * unit),
+            unit,
+            skin: &skin,
+            textures: &textures,
+            mask: None,
+        };
+        vinyl_spinning = vinyl::show(app, &mut below, now.as_ref(), time);
+        below_y += vinyl::HEIGHT;
+    }
     if app.settings.eq_open {
         let eq_shaded = app.settings.eq_shaded;
         let mut below = View {
@@ -397,7 +414,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         playlist::show(app, &mut below, now.as_ref(), focused);
     }
 
-    if vis_moving {
+    if vis_moving || vinyl_spinning {
         crate::theme::visualiser_frame(&ctx, app.visualiser_fps());
     } else if now.is_some() {
         ctx.request_repaint_after(Duration::from_millis(220));
@@ -741,6 +758,10 @@ fn options_menu(app: &mut App, ui: &mut Ui, unit: f32) {
         .clicked()
     {
         app.actions.push(Action::ToggleWinampMilkdrop);
+    }
+    let mut vinyl = app.settings.vinyl_open;
+    if ui.checkbox(&mut vinyl, "Turntable").clicked() {
+        app.actions.push(Action::ToggleWinampVinyl);
     }
     if ui
         .button(gettext(locale, "Choose a skin").as_ref())
@@ -1673,6 +1694,8 @@ mod tests {
     #[test]
     fn the_first_size_is_a_whole_multiple_of_the_skin() {
         let mut settings = crate::settings::Settings::default();
+        assert_eq!(initial_size(&settings), vec2(550.0, 464.0));
+        settings.vinyl_open = false;
         assert_eq!(initial_size(&settings), vec2(550.0, 232.0));
         settings.skin_scale = Some(1);
         assert_eq!(initial_size(&settings), vec2(275.0, 116.0));

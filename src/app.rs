@@ -11640,6 +11640,10 @@ impl App {
                 self.settings.eq_open = !self.settings.eq_open;
                 self.settings_dirty = true;
             }
+            Action::ToggleWinampVinyl => {
+                self.settings.vinyl_open = !self.settings.vinyl_open;
+                self.settings_dirty = true;
+            }
             Action::ToggleEq => {
                 self.settings.eq_on = !self.settings.eq_on;
                 self.push_eq();
