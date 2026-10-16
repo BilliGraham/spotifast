@@ -18,11 +18,12 @@ pub const CONFIG: UpdateConfig = UpdateConfig {
         executable_names: &["Spotifast"],
         legacy_bundle_names: &[],
     },
-    // Releases publish an Ed25519 signature for checksums.txt. Require it
-    // before downloading an update, using the release workflow's public key.
-    publisher_key: Some(include_str!("../assets/update-public-key.hex")),
+    // This fork publishes its own releases, with the vinyl turntable added,
+    // signed by .github/workflows/fork-release.yml with the fork's own key.
+    // Upstream's key cannot sign them, so it is not trusted here.
+    publisher_key: Some(include_str!("../assets/fork-update-public-key.hex")),
     ..UpdateConfig::new(
-        "crmne/spotifast",
+        "BilliGraham/spotifast",
         "Spotifast",
         "spotifast",
         env!("CARGO_PKG_VERSION"),
