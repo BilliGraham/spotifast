@@ -175,10 +175,14 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           name: windows
-          path: dist
+          # The artifact keeps the build's paths: dist/... and notes.md.
+          path: ${{ runner.temp }}/artifact
       - name: Checksums
         run: |
-          mv dist/notes.md "$RUNNER_TEMP/notes.md"
+          mkdir -p dist
+          mv "$RUNNER_TEMP"/artifact/dist/* dist/
+          mv "$RUNNER_TEMP/artifact/notes.md" "$RUNNER_TEMP/notes.md"
+          ls -l dist
           python3 packaging/release-names.py dist "$TAG"
           cat dist/checksums.txt
 
