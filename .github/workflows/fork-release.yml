@@ -5,6 +5,11 @@ name: Fork release
 # points at this repository) installs it.
 #
 # Upstream's workflows are disabled in the fork: they need upstream's secrets.
+#
+# The updater only reads major.minor.patch and only installs a higher
+# version, so a fork release is numbered major.minor.(patch * 100 +
+# revision): upstream 0.13.3 builds as 0.13.300, a fork-only change on it as
+# 0.13.301, and upstream 0.13.4 as 0.13.400, which is newer than both.
 
 on:
   schedule:
@@ -13,6 +18,9 @@ on:
     inputs:
       tag:
         description: Upstream tag to build, such as v0.13.3. Empty builds the latest.
+        required: false
+      revision:
+        description: Fork revision, 0 to 99, for a fork-only change on the same upstream tag. Empty builds 0 if that tag has no release yet.
         required: false
 
 permissions:
@@ -27,12 +35,14 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
       build: ${{ steps.pick.outputs.build }}
     steps:
       - id: pick
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED: ${{ inputs.tag }}
+          REVISION: ${{ inputs.revision }}
         run: |
           tag="$REQUESTED"
           if [ -z "$tag" ]; then
@@ -41,13 +51,37 @@ jobs:
               | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
               | sort -V | tail -n 1)
           fi
+          if ! [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Not a release tag: $tag" >&2
+            exit 1
+          fi
+          major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+          base=$((patch * 100))
+          released=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName')
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          if [ -z "$REVISION" ]; then
+            for existing in $released; do
+              if [[ "$existing" =~ ^v${major}\.${minor}\.([0-9]+)$ ]] \
+                && [ "${BASH_REMATCH[1]}" -ge "$base" ] && [ "${BASH_REMATCH[1]}" -lt $((base + 100)) ]; then
+                echo "build=false" >> "$GITHUB_OUTPUT"
+                echo "$tag is already released here as $existing."
+                exit 0
+              fi
+            done
+            REVISION=0
+          fi
+          if ! [[ "$REVISION" =~ ^[0-9]{1,2}$ ]]; then
+            echo "The revision must be 0 to 99: $REVISION" >&2
+            exit 1
+          fi
+          version="$major.$minor.$((base + 10#$REVISION))"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if grep -qx "v$version" <<< "$released"; then
             echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "$tag is already released here."
+            echo "v$version is already released here."
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "Building $tag."
+            echo "Building $tag as v$version."
           fi
 
   build:
@@ -57,6 +91,8 @@ jobs:
     env:
       CMAKE_GENERATOR: Ninja
       TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE: v${{ needs.prepare.outputs.version }}
       TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v7
@@ -79,8 +115,10 @@ jobs:
           for commit in $commits; do
             git cherry-pick "$commit"
           done
+          sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
           {
-            echo "Spotifast $TAG with the vinyl turntable in the mini player."
+            echo "Spotifast $RELEASE: upstream $TAG with the vinyl turntable in the mini player."
             echo
             echo "Built from upstream [$TAG](https://github.com/crmne/spotifast/releases/tag/$TAG) plus:"
             echo
@@ -110,12 +148,12 @@ jobs:
           $runtime = $imports | Select-String -Pattern 'MSVCP[0-9_]*\.dll|VCRUNTIME[0-9_]*\.dll'
           if ($runtime) { throw "Spotifast imports an MSVC runtime:`n$runtime" }
           $version = (& $binary --version | Out-String).Trim()
-          if ($version -notmatch '^spotifast \d+\.\d+\.\d+') { throw "Unexpected --version output: $version" }
+          if ($version -ne "spotifast $env:VERSION") { throw "Unexpected --version output: $version" }
 
       - name: Package
         shell: bash
         run: |
-          name="spotifast-${TAG}-${TARGET}"
+          name="spotifast-${RELEASE}-${TARGET}"
           mkdir -p "dist/$name"
           cp "target/${TARGET}/release/spotifast.exe" README.md LICENSE packaging/spotifast-portable.txt "dist/$name/"
           cd dist
@@ -124,10 +162,9 @@ jobs:
       - name: Installer
         shell: pwsh
         run: |
-          $version = $env:TAG.TrimStart("v")
           $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
           if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
-          & $iscc "/DVersion=$version" "/DArch=x86_64" `
+          & $iscc "/DVersion=$env:VERSION" "/DArch=x86_64" `
             "/DBinary=$PWD\target\$env:TARGET\release\spotifast.exe" `
             "/DOutputDir=$PWD\dist" packaging\windows\spotifast.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -143,13 +180,12 @@ jobs:
           $env:PATH = "$env:RUNNER_TEMP\wix;$env:PATH"
           gem install native-packages --version 0.9.0 --no-document
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $version = $env:TAG.TrimStart("v")
           $payload = "dist\msi-input-$env:TARGET"
           New-Item -ItemType Directory -Force $payload | Out-Null
           $files = "target\$env:TARGET\release\spotifast.exe", "README.md", "LICENSE", "packaging\windows\spotifast-installer.txt"
           Copy-Item $files $payload
           $packages = "$env:RUNNER_TEMP\windows-packages"
-          native-packages build --version $version --target windows-amd64 --defer-recipes --output $packages
+          native-packages build --version $env:VERSION --target windows-amd64 --defer-recipes --output $packages
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item "$packages\packages\windows-amd64\msi\*.msi" dist\
 
@@ -167,7 +203,7 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     env:
-      TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE: v${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -183,7 +219,7 @@ jobs:
           mv "$RUNNER_TEMP"/artifact/dist/* dist/
           mv "$RUNNER_TEMP/artifact/notes.md" "$RUNNER_TEMP/notes.md"
           ls -l dist
-          python3 packaging/release-names.py dist "$TAG"
+          python3 packaging/release-names.py dist "$RELEASE"
           cat dist/checksums.txt
 
       # fastframe-update checks a raw 64-byte Ed25519 signature of the exact
@@ -213,9 +249,9 @@ jobs:
       # workflows permission. The release notes name what was built.
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.TAG }}
+          tag_name: ${{ env.RELEASE }}
           target_commitish: ${{ github.sha }}
-          name: Spotifast ${{ env.TAG }} (vinyl)
+          name: Spotifast ${{ env.RELEASE }} (vinyl)
           body_path: ${{ runner.temp }}/notes.md
           files: dist/*
           make_latest: true
