@@ -187,7 +187,11 @@ jobs:
           dotnet tool install wix --version 5.0.2 --tool-path "$env:RUNNER_TEMP\wix"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:PATH = "$env:RUNNER_TEMP\wix;$env:PATH"
-          gem install native-packages --version 0.9.0 --no-document
+          # The version upstream's configuration asks for at this tag; a
+          # fixed one stopped working when v0.14.1 moved to 0.10.0.
+          $tool = (Select-String -Path native-packages.yaml -Pattern '^\s+version:\s*(\S+)' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if (-not $tool) { throw "native-packages.yaml names no tool version" }
+          gem install native-packages --version $tool --no-document
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $payload = "dist\msi-input-$env:TARGET"
           New-Item -ItemType Directory -Force $payload | Out-Null
