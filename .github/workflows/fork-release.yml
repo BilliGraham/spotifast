@@ -117,6 +117,15 @@ jobs:
           done
           sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
           grep -m1 '^version = ' Cargo.toml
+          # The updater is pointed at this fork here, not in a commit:
+          # upstream edits src/updates.rs often, and a commit there stopped
+          # applying at v0.14.1. Fail if upstream renamed what is replaced.
+          sed -i "s#\"crmne/spotifast\",#\"$GITHUB_REPOSITORY\",#" src/updates.rs
+          grep -q "\"$GITHUB_REPOSITORY\"," src/updates.rs \
+            || { echo "src/updates.rs no longer names crmne/spotifast" >&2; exit 1; }
+          grep -q 'include_str!("../assets/update-public-key.hex")' src/updates.rs \
+            || { echo "src/updates.rs no longer reads assets/update-public-key.hex" >&2; exit 1; }
+          cp assets/fork-update-public-key.hex assets/update-public-key.hex
           {
             echo "Spotifast $RELEASE: upstream $TAG with the vinyl turntable in the mini player."
             echo
