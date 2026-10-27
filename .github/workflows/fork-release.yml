@@ -1,0 +1,270 @@
+name: Fork release
+
+# Builds each new upstream release with this fork's own commits on top, and
+# publishes it here, signed with the fork's key, so the app's updater (which
+# points at this repository) installs it.
+#
+# Upstream's workflows are disabled in the fork: they need upstream's secrets.
+#
+# The updater only reads major.minor.patch and only installs a higher
+# version, so a fork release is numbered major.minor.(patch * 100 +
+# revision): upstream 0.13.3 builds as 0.13.300, a fork-only change on it as
+# 0.13.301, and upstream 0.13.4 as 0.13.400, which is newer than both.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to build, such as v0.13.3. Empty builds the latest.
+        required: false
+      revision:
+        description: Fork revision, 0 to 99, for a fork-only change on the same upstream tag. Empty builds 0 if that tag has no release yet.
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  UPSTREAM: https://github.com/crmne/spotifast.git
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tag }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          tag="$REQUESTED"
+          if [ -z "$tag" ]; then
+            tag=$(git ls-remote --tags --refs "$UPSTREAM" 'v*' \
+              | sed 's#.*refs/tags/##' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n 1)
+          fi
+          if ! [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Not a release tag: $tag" >&2
+            exit 1
+          fi
+          major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+          base=$((patch * 100))
+          released=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -z "$REVISION" ]; then
+            for existing in $released; do
+              if [[ "$existing" =~ ^v${major}\.${minor}\.([0-9]+)$ ]] \
+                && [ "${BASH_REMATCH[1]}" -ge "$base" ] && [ "${BASH_REMATCH[1]}" -lt $((base + 100)) ]; then
+                echo "build=false" >> "$GITHUB_OUTPUT"
+                echo "$tag is already released here as $existing."
+                exit 0
+              fi
+            done
+            REVISION=0
+          fi
+          if ! [[ "$REVISION" =~ ^[0-9]{1,2}$ ]]; then
+            echo "The revision must be 0 to 99: $REVISION" >&2
+            exit 1
+          fi
+          version="$major.$minor.$((base + 10#$REVISION))"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if grep -qx "v$version" <<< "$released"; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "v$version is already released here."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Building $tag as v$version."
+          fi
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: windows-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE: v${{ needs.prepare.outputs.version }}
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The fork's commits are the ones on this branch that upstream's main
+      # does not have. Commits that only change .github stay out: the build
+      # uses upstream's tree at the tag plus the app changes.
+      - name: Apply the fork's commits to the upstream tag
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          fork_head=$(git rev-parse HEAD)
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main "refs/tags/$TAG:refs/upstream-tags/$TAG"
+          commits=$(git rev-list --reverse --no-merges upstream/main.."$fork_head" -- . ':(exclude).github')
+          git checkout -B fork-build "refs/upstream-tags/$TAG"
+          for commit in $commits; do
+            git cherry-pick "$commit"
+          done
+          sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
+          # The updater is pointed at this fork here, not in a commit:
+          # upstream edits src/updates.rs often, and a commit there stopped
+          # applying at v0.14.1. Fail if upstream renamed what is replaced.
+          sed -i "s#\"crmne/spotifast\",#\"$GITHUB_REPOSITORY\",#" src/updates.rs
+          grep -q "\"$GITHUB_REPOSITORY\"," src/updates.rs \
+            || { echo "src/updates.rs no longer names crmne/spotifast" >&2; exit 1; }
+          grep -q 'include_str!("../assets/update-public-key.hex")' src/updates.rs \
+            || { echo "src/updates.rs no longer reads assets/update-public-key.hex" >&2; exit 1; }
+          cp assets/fork-update-public-key.hex assets/update-public-key.hex
+          {
+            echo "Spotifast $RELEASE: upstream $TAG with the vinyl turntable in the mini player."
+            echo
+            echo "Built from upstream [$TAG](https://github.com/crmne/spotifast/releases/tag/$TAG) plus:"
+            echo
+            for commit in $commits; do
+              echo "- $(git log -1 --format='%s (%h)' "$commit")"
+            done
+          } > "$RUNNER_TEMP/notes.md"
+          cp "$RUNNER_TEMP/notes.md" notes.md
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - run: rustup target add ${{ env.TARGET }}
+      - name: GLEW for libprojectM
+        run: vcpkg install glew:x64-windows-static
+      - name: MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Verify standalone Windows runtime
+        shell: pwsh
+        run: |
+          $binary = "target\$env:TARGET\release\spotifast.exe"
+          $imports = & dumpbin /dependents $binary | Out-String
+          $runtime = $imports | Select-String -Pattern 'MSVCP[0-9_]*\.dll|VCRUNTIME[0-9_]*\.dll'
+          if ($runtime) { throw "Spotifast imports an MSVC runtime:`n$runtime" }
+          $version = (& $binary --version | Out-String).Trim()
+          if ($version -ne "spotifast $env:VERSION") { throw "Unexpected --version output: $version" }
+
+      - name: Package
+        shell: bash
+        run: |
+          name="spotifast-${RELEASE}-${TARGET}"
+          mkdir -p "dist/$name"
+          cp "target/${TARGET}/release/spotifast.exe" README.md LICENSE packaging/spotifast-portable.txt "dist/$name/"
+          cd dist
+          7z a "$name.zip" "$name"
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DVersion=$env:VERSION" "/DArch=x86_64" `
+            "/DBinary=$PWD\target\$env:TARGET\release\spotifast.exe" `
+            "/DOutputDir=$PWD\dist" packaging\windows\spotifast.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0'
+      - name: Windows Installer package
+        shell: pwsh
+        run: |
+          dotnet tool install wix --version 5.0.2 --tool-path "$env:RUNNER_TEMP\wix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "$env:RUNNER_TEMP\wix;$env:PATH"
+          # The version upstream's configuration asks for at this tag; a
+          # fixed one stopped working when v0.14.1 moved to 0.10.0.
+          $tool = (Select-String -Path native-packages.yaml -Pattern '^\s+version:\s*(\S+)' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if (-not $tool) { throw "native-packages.yaml names no tool version" }
+          gem install native-packages --version $tool --no-document
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $payload = "dist\msi-input-$env:TARGET"
+          New-Item -ItemType Directory -Force $payload | Out-Null
+          $files = "target\$env:TARGET\release\spotifast.exe", "README.md", "LICENSE", "packaging\windows\spotifast-installer.txt"
+          Copy-Item $files $payload
+          $packages = "$env:RUNNER_TEMP\windows-packages"
+          native-packages build --version $env:VERSION --target windows-amd64 --defer-recipes --output $packages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item "$packages\packages\windows-amd64\msi\*.msi" dist\
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+            dist/*.msi
+            notes.md
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE: v${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: windows
+          # The artifact keeps the build's paths: dist/... and notes.md.
+          path: ${{ runner.temp }}/artifact
+      - name: Checksums
+        run: |
+          mkdir -p dist
+          mv "$RUNNER_TEMP"/artifact/dist/* dist/
+          mv "$RUNNER_TEMP/artifact/notes.md" "$RUNNER_TEMP/notes.md"
+          ls -l dist
+          python3 packaging/release-names.py dist "$RELEASE"
+          cat dist/checksums.txt
+
+      # fastframe-update checks a raw 64-byte Ed25519 signature of the exact
+      # bytes of checksums.txt against assets/fork-update-public-key.hex.
+      - name: Sign checksums
+        env:
+          FORK_UPDATE_SIGNING_KEY: ${{ secrets.FORK_UPDATE_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$FORK_UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          expected=$(tr -d '[:space:]' < assets/fork-update-public-key.hex)
+          actual=$(openssl pkey -in "$RUNNER_TEMP/key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')
+          if [ "$expected" != "$actual" ]; then
+            echo "The signing key does not match assets/fork-update-public-key.hex" >&2
+            exit 1
+          fi
+          openssl pkeyutl -sign -rawin -inkey "$RUNNER_TEMP/key.pem" \
+            -in dist/checksums.txt -out dist/checksums.txt.sig
+          openssl pkey -in "$RUNNER_TEMP/key.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/public.pem" \
+            -in dist/checksums.txt -sigfile dist/checksums.txt.sig
+          rm "$RUNNER_TEMP/key.pem"
+          test "$(stat -c %s dist/checksums.txt.sig)" = 64
+
+      # The tag points at this fork's main, not at the built tree, because a
+      # push of upstream's newer commits would need a token with the
+      # workflows permission. The release notes name what was built.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE }}
+          target_commitish: ${{ github.sha }}
+          name: Spotifast ${{ env.RELEASE }} (vinyl)
+          body_path: ${{ runner.temp }}/notes.md
+          files: dist/*
+          make_latest: true
