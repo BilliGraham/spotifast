@@ -403,6 +403,8 @@ pub struct Settings {
     pub playlist_height: u32,
     /// The equalizer window is open under the mini player.
     pub eq_open: bool,
+    /// The turntable window is open under the mini player.
+    pub vinyl_open: bool,
     /// The equalizer shapes local playback.
     pub eq_on: bool,
     /// The preamp, in decibels, never above zero.
@@ -543,6 +545,7 @@ impl Default for Settings {
             playlist_open: false,
             playlist_height: 174,
             eq_open: false,
+            vinyl_open: true,
             eq_on: false,
             eq_preamp_db: 0.0,
             eq_bands_db: [0.0; 10],

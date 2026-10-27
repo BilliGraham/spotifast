@@ -30,17 +30,14 @@ use super::widgets::{SliderEvent, wheel_notches};
 mod equalizer;
 mod pixel_text;
 mod playlist;
+mod vinyl;
 
 pub use pixel_text::PixelText;
 
 /// The stack's height in skin pixels: the main window, and the equalizer
 /// and the playlist under it, whichever are open.
 fn stack_height(settings: &crate::settings::Settings) -> u32 {
-    let mut height = if settings.winamp_shaded {
-        layout::SHADE_HEIGHT
-    } else {
-        layout::WINDOW_HEIGHT
-    };
+    let mut height = main_height(settings);
     if settings.eq_open {
         height += if settings.eq_shaded {
             layout::EQ_SHADE_HEIGHT
@@ -58,6 +55,18 @@ fn stack_height(settings: &crate::settings::Settings) -> u32 {
         };
     }
     height
+}
+
+/// The main window's height in skin pixels: rolled up, as the skin draws
+/// it, or taller to make room for the turntable.
+fn main_height(settings: &crate::settings::Settings) -> u32 {
+    if settings.winamp_shaded {
+        layout::SHADE_HEIGHT
+    } else if settings.vinyl_open {
+        layout::WINDOW_HEIGHT + vinyl::EXTRA_HEIGHT
+    } else {
+        layout::WINDOW_HEIGHT
+    }
 }
 
 /// The window's size in logical points, for the given points per skin
@@ -124,12 +133,24 @@ struct View<'a> {
     /// The window's shape, when the skin is not a rectangle: nothing is
     /// painted outside it.
     mask: Option<&'a Mask>,
+    /// A taller window: the skin row it is cut at, and how many rows are
+    /// added there. See [`View::paint`].
+    stretch: Option<(u32, u32)>,
 }
 
 impl View<'_> {
+    /// Where a skin row is drawn: rows from the cut down move by the rows
+    /// added.
+    fn row(&self, y: u32) -> u32 {
+        match self.stretch {
+            Some((split, extra)) if y >= split => y + extra,
+            _ => y,
+        }
+    }
+
     fn rect(&self, area: Area) -> Rect {
         Rect::from_min_size(
-            self.origin + vec2(area.x as f32, area.y as f32) * self.unit,
+            self.origin + vec2(area.x as f32, self.row(area.y) as f32) * self.unit,
             vec2(area.width as f32, area.height as f32) * self.unit,
         )
     }
@@ -139,6 +160,11 @@ impl View<'_> {
         (pos.x - self.origin.x) / self.unit
     }
 
+    /// Paints a sprite with its top left at skin pixel `x`, `y`. In a
+    /// stretched window, a sprite that starts below the cut moves down with
+    /// it, and one that the cut runs through (the background, the clutter
+    /// bar) is split there, with the row above the cut repeated to fill the
+    /// added rows, so the boxes it draws grow instead of breaking.
     fn paint(&self, painter: &egui::Painter, sprite: Sprite, x: u32, y: u32) {
         let Some((bitmap, clipped)) = self.skin.sprite(sprite) else {
             return;
@@ -147,9 +173,9 @@ impl View<'_> {
             return;
         };
         let (width, height) = (bitmap.width as f32, bitmap.height as f32);
-        // A piece of the sprite, `dx` in and `columns` wide, on one row or
-        // all of them.
-        let piece = |dx: u32, dy: u32, columns: u32, rows: u32| {
+        // `rows` rows of the sprite from `dy`, `columns` wide from `dx`,
+        // drawn `drawn_rows` tall from window row `top`.
+        let piece = |dx: u32, dy: u32, columns: u32, rows: u32, top: u32, drawn_rows: u32| {
             let uv = Rect::from_min_max(
                 pos2(
                     (clipped.x + dx) as f32 / width,
@@ -161,25 +187,65 @@ impl View<'_> {
                 ),
             );
             let dest = Rect::from_min_size(
-                self.origin + vec2((x + dx) as f32, (y + dy) as f32) * self.unit,
-                vec2(columns as f32, rows as f32) * self.unit,
+                self.origin + vec2((x + dx) as f32, top as f32) * self.unit,
+                vec2(columns as f32, drawn_rows as f32) * self.unit,
             );
             painter.image(texture, dest, uv, Color32::WHITE);
         };
-        match self.mask {
-            None => piece(0, 0, clipped.width, clipped.height),
+        // Rows `dy..dy + rows` of the sprite, from window row `top`, each
+        // `scale` rows tall, cut to the window's shape.
+        let band = |dy: u32, rows: u32, top: u32, scale: u32| match self.mask {
+            None => piece(0, dy, clipped.width, rows, top, rows * scale),
             Some(mask) => {
-                for dy in 0..clipped.height {
-                    for (start, end) in mask.spans(y + dy) {
+                for row in 0..rows {
+                    for (start, end) in mask.spans(y + dy + row) {
                         let from = (*start).max(x);
                         let to = (*end).min(x + clipped.width);
                         if to > from {
-                            piece(from - x, dy, to - from, 1);
+                            piece(from - x, dy + row, to - from, 1, top + row * scale, scale);
                         }
                     }
                 }
             }
+        };
+        match self.stretch {
+            Some((split, extra)) if y < split && split < y + clipped.height => {
+                let above = split - y;
+                band(0, above, y, 1);
+                band(above - 1, 1, split, extra);
+                band(above, clipped.height - above, split + extra, 1);
+            }
+            _ => band(0, clipped.height, self.row(y), 1),
         }
+    }
+
+    /// Paints a sprite at window skin pixel `x`, `y`, drawn `width` by
+    /// `height` skin pixels, where the stretch has already been allowed
+    /// for. Nearest-neighbour textures keep a whole-number enlargement
+    /// sharp. The window's shape is not applied.
+    fn paint_placed(&self, sprite: Sprite, x: u32, y: u32, width: u32, height: u32) {
+        let Some((bitmap, clipped)) = self.skin.sprite(sprite) else {
+            return;
+        };
+        let Some(&texture) = self.textures.get(&sprite.sheet) else {
+            return;
+        };
+        let (sheet_width, sheet_height) = (bitmap.width as f32, bitmap.height as f32);
+        let uv = Rect::from_min_max(
+            pos2(
+                clipped.x as f32 / sheet_width,
+                clipped.y as f32 / sheet_height,
+            ),
+            pos2(
+                (clipped.x + clipped.width) as f32 / sheet_width,
+                (clipped.y + clipped.height) as f32 / sheet_height,
+            ),
+        );
+        let dest = Rect::from_min_size(
+            self.origin + vec2(x as f32, y as f32) * self.unit,
+            vec2(width as f32, height as f32) * self.unit,
+        );
+        self.ui.painter().image(texture, dest, uv, Color32::WHITE);
     }
 
     fn sprite_at(&self, sprite: Sprite, x: u32, y: u32) {
@@ -195,9 +261,10 @@ impl View<'_> {
 
     /// A block of skin pixels in one colour.
     fn fill(&self, x: u32, y: u32, width: u32, height: u32, color: Color32) {
+        let shift = self.row(y) - y;
         let block = |x: u32, y: u32, width: u32, height: u32| {
             let rect = Rect::from_min_size(
-                self.origin + vec2(x as f32, y as f32) * self.unit,
+                self.origin + vec2(x as f32, (y + shift) as f32) * self.unit,
                 vec2(width as f32, height as f32) * self.unit,
             );
             self.ui.painter().rect_filled(rect, 0.0, color);
@@ -350,19 +417,17 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         skin: &skin,
         textures: &textures,
         mask,
+        stretch: (!shaded && app.settings.vinyl_open)
+            .then_some((vinyl::SPLIT, vinyl::EXTRA_HEIGHT)),
     };
-    let vis_moving = if shaded {
+    let moving = if shaded {
         shade_bar(app, &mut view, &ctx, focused, now.as_ref())
     } else {
         full_window(app, &mut view, &ctx, focused, now.as_ref(), time)
     };
 
     // The other windows hang under this one in Winamp's order.
-    let mut below_y = if shaded {
-        layout::SHADE_HEIGHT
-    } else {
-        layout::WINDOW_HEIGHT
-    };
+    let mut below_y = main_height(&app.settings);
     if app.settings.eq_open {
         let eq_shaded = app.settings.eq_shaded;
         let mut below = View {
@@ -376,6 +441,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             } else {
                 skin.regions.equalizer.as_ref()
             },
+            stretch: None,
         };
         equalizer::show(app, &mut below, now.as_ref(), focused);
         below_y += if eq_shaded {
@@ -392,19 +458,20 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             skin: &skin,
             textures: &textures,
             mask: None,
+            stretch: None,
         };
         playlist::show(app, &mut below, now.as_ref(), focused);
     }
 
-    if vis_moving {
+    if moving {
         crate::theme::visualiser_frame(&ctx, app.visualiser_fps());
     } else if now.is_some() {
         ctx.request_repaint_after(Duration::from_millis(220));
     }
 }
 
-/// The main window as it usually is. Returns whether the visualiser is
-/// still moving.
+/// The main window as it usually is. Returns whether the visualiser or the
+/// turntable is still moving.
 fn full_window(
     app: &mut App,
     view: &mut View,
@@ -418,10 +485,21 @@ fn full_window(
         Area::new(0, 0, layout::WINDOW_WIDTH, layout::WINDOW_HEIGHT),
     );
     title_bar(app, view, ctx, focused);
-    clutter_bar(app, view, now);
+    // The turntable fills the whole display box, so the clutter bar, the
+    // time and the visualiser are not drawn there. The options menu is
+    // still on a right-click on the title bar.
+    let turntable = app.settings.vinyl_open;
+    if !turntable {
+        clutter_bar(app, view, now);
+    }
     status(app, view, now);
-    time_display(app, view, now, time);
-    let vis_moving = visualiser(app, view, now, layout::VISUALIZER);
+    let vis_moving = if turntable {
+        vinyl::timer_box(app, view, now, time);
+        vinyl::show(app, view, now, time)
+    } else {
+        time_display(app, view, now, time);
+        visualiser(app, view, now, layout::VISUALIZER)
+    };
     marquee(app, view, now);
     rates(app, view, now);
     sliders(app, view, now);
@@ -745,6 +823,10 @@ fn options_menu(app: &mut App, ui: &mut Ui, unit: f32) {
     {
         app.actions.push(Action::ToggleWinampMilkdrop);
     }
+    let mut vinyl = app.settings.vinyl_open;
+    if ui.checkbox(&mut vinyl, "Turntable").clicked() {
+        app.actions.push(Action::ToggleWinampVinyl);
+    }
     if ui
         .button(gettext(locale, "Choose a skin").as_ref())
         .clicked()
@@ -1045,16 +1127,19 @@ fn status(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
         Some(_) if !stopped(now) => sprites::STATUS_PAUSED,
         _ => sprites::STATUS_STOPPED,
     };
-    view.sprite(status, layout::STATUS);
-    let working = now.is_some_and(|now| now.loading);
-    view.sprite(
-        if working {
-            sprites::WORK_INDICATOR_ON
-        } else {
-            sprites::WORK_INDICATOR_OFF
-        },
-        layout::WORK_INDICATOR,
-    );
+    // The turntable takes the lamps' place in the display.
+    if !app.settings.vinyl_open {
+        view.sprite(status, layout::STATUS);
+        let working = now.is_some_and(|now| now.loading);
+        view.sprite(
+            if working {
+                sprites::WORK_INDICATOR_ON
+            } else {
+                sprites::WORK_INDICATOR_OFF
+            },
+            layout::WORK_INDICATOR,
+        );
+    }
     let sounding = now.is_some() && !stopped(now);
     let mono = app.settings.mono;
     let (stereo, mono_lamp) = match (sounding, mono) {
@@ -1079,6 +1164,42 @@ fn status(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
         && mono
     {
         app.actions.push(Action::ToggleMono);
+    }
+}
+
+/// What the time display shows: nothing, or four digits and whether they
+/// count down.
+enum ShownTime {
+    Blank,
+    Time { digits: [u32; 4], remaining: bool },
+}
+
+/// The time to show: elapsed, or remaining, blinking while paused, blank
+/// with nothing on.
+fn shown_time(app: &App, now: Option<&NowPlaying>, time: f64) -> ShownTime {
+    let Some(now) = now.filter(|now| !stopped(Some(now))) else {
+        return ShownTime::Blank;
+    };
+    let paused = !now.playing && !now.loading;
+    if paused && (time * 2.0).floor() as i64 % 2 == 1 {
+        return ShownTime::Blank;
+    }
+    let position = match app.seek_preview {
+        Some(fraction) => (fraction * now.duration_ms as f32) as u32,
+        None => now.position_ms,
+    };
+    let remaining = app.winamp.time_remaining && now.duration_ms > 0;
+    let shown = if remaining {
+        now.duration_ms.saturating_sub(position)
+    } else {
+        position
+    };
+    let seconds = shown / 1000;
+    let minutes = (seconds / 60).min(99);
+    let seconds = seconds % 60;
+    ShownTime::Time {
+        digits: [minutes / 10, minutes % 10, seconds / 10, seconds % 10],
+        remaining,
     }
 }
 
@@ -1111,29 +1232,10 @@ fn time_display(app: &mut App, view: &mut View, now: Option<&NowPlaying>, time: 
             view.sprite(sprites::NUMBERS_NO_MINUS, layout::MINUS);
         }
     };
-    let Some(now) = now.filter(|now| !stopped(Some(now))) else {
+    let ShownTime::Time { digits, remaining } = shown_time(app, now, time) else {
         blank(view);
         return;
     };
-    let paused = !now.playing && !now.loading;
-    if paused && (time * 2.0).floor() as i64 % 2 == 1 {
-        blank(view);
-        return;
-    }
-    let position = match app.seek_preview {
-        Some(fraction) => (fraction * now.duration_ms as f32) as u32,
-        None => now.position_ms,
-    };
-    let remaining = app.winamp.time_remaining && now.duration_ms > 0;
-    let shown = if remaining {
-        now.duration_ms.saturating_sub(position)
-    } else {
-        position
-    };
-    let seconds = shown / 1000;
-    let minutes = (seconds / 60).min(99);
-    let seconds = seconds % 60;
-    let digits = [minutes / 10, minutes % 10, seconds / 10, seconds % 10];
     for (value, cell) in digits.into_iter().zip(layout::TIME_DIGITS) {
         let sprite = if extended {
             sprites::digit_ex(value)
@@ -1679,6 +1781,8 @@ mod tests {
     #[test]
     fn the_first_size_is_a_whole_multiple_of_the_skin() {
         let mut settings = crate::settings::Settings::default();
+        assert_eq!(initial_size(&settings), vec2(550.0, 292.0));
+        settings.vinyl_open = false;
         assert_eq!(initial_size(&settings), vec2(550.0, 232.0));
         settings.skin_scale = Some(1);
         assert_eq!(initial_size(&settings), vec2(275.0, 116.0));

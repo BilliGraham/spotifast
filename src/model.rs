@@ -1416,6 +1416,8 @@ pub enum Action {
     SetPlaylistHeight(u32),
     /// Open or close the equalizer window under the mini player.
     ToggleWinampEq,
+    /// Open or close the turntable window under the mini player.
+    ToggleWinampVinyl,
     /// Switch the equalizer's effect on the sound on or off.
     ToggleEq,
     SetEqBand(usize, f32),
