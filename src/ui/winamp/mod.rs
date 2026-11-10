@@ -508,6 +508,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             skin: &skin,
             textures: &textures,
             mask: None,
+            stretch: None,
         };
         if milkdrop::show(app, &mut below, focused) {
             crate::theme::visualiser_frame(&ctx, Some(app.milkdrop_pane_fps()));
